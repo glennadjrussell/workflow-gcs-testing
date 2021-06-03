@@ -2,29 +2,124 @@
 # The workflow creates a Cloud Storage bucket and then deletes it.
 # Expected successful output: "SUCCESS"
 
-- init:
-    assign:
-    - project_id: ${sys.get_env("GOOGLE_CLOUD_PROJECT_ID")}
-    - bucket_name: "glenns-dummy-bucket"
-    - existing_bucket: "qbank-test-bucket"
-- create_bucket:
-    call: googleapis.storage.v1.buckets.insert
-    args:
-      project: ${project_id}
-      body:
-        name: ${bucket_name}
-- get_bucket:
-    call: googleapis.storage.v1.buckets.get
-    args:
-      bucket: ${bucket_name}
-- list_bucket:
-    call: googleapis.storage.v1.objects.list
-    args:
-      bucket: ${existing_bucket}
-    result: listResult
-- delete_bucket:
-    call: googleapis.storage.v1.buckets.delete
-    args:
-      bucket: ${bucket_name}
-- the_end:
-    return: ${listResult}
+main:
+  params: [args]
+  steps:
+    - init:
+        assign:
+        - project_id: ${sys.get_env("GOOGLE_CLOUD_PROJECT_ID")}
+        - existing_bucket: "qbank-test-bucket"
+
+    - list_bucket:
+        call: googleapis.storage.v1.objects.list
+        args:
+          bucket: ${existing_bucket}
+          prefix: 'import/'
+        result: listResult
+
+    - filter_files:
+        call: filter_by_pattern
+        args:
+          bucket_name: existing_bucket
+          file_list: ${listResult.items}
+          pattern: "avro"
+        result: ingestList
+
+    - invoke_func:
+        call: http.post
+        args:
+          url: https://us-central1-qbank-266411.cloudfunctions.net/ingest-trigger
+          body:
+            {
+              "bucket": "qbank-test-bucket",
+              "pattern": "avro"
+            }
+          headers:
+            Content-Type: "application/json"
+          auth:
+            type: OIDC
+        result: funcFilteredList
+
+    #- end_load:
+    #    return: ${funcFilteredList}
+
+    - configure_bigquery:
+        assign:
+          - request_body:
+              configuration:
+                load:
+                  destinationTable:
+                    datasetId: "testdataset"
+                    projectId: "qbank-266411"
+                    tableId: "workflow_test"
+                  sourceUris: ${funcFilteredList.body.result}
+                  sourceFormat: "AVRO"
+                  createDisposition: "CREATE_IF_NEEDED"
+                  writeDisposition: "WRITE_APPEND"
+
+    - load_bigquery:
+        call: http.post
+        args:
+          url: ${"https://bigquery.googleapis.com/bigquery/v2/projects/" + project_id + "/jobs"}
+          body:
+            ${request_body}
+          headers:
+            Content-Type: "application/json"
+          auth:
+            type: OAuth2
+        result: bqLoadResult
+
+    - bigquery_status:
+        call: get_bq_status
+        args:
+          joburl: ${bqLoadResult.body.selfLink}
+        result: bqFinalStatus
+
+    - check_result:
+        switch:
+          - condition: ${"errorResult" in bqFinalStatus.body.status }
+            raise: ${bqFinalStatus.body.status.errors}
+
+    - the_end:
+        return: ${bqFinalStatus}
+
+get_bq_status:
+  params: [joburl]
+  steps:
+    - sleep:
+        call: sys.sleep
+        args:
+          seconds: 10
+    - get_current_status:
+        call: http.get
+        args:
+          url: ${joburl}
+          auth:
+            type: OAuth2
+        result: job_status
+    - is_finished:
+        switch:
+          - condition: ${job_status.body.status.state == "DONE"}
+            return: ${job_status}
+        next: sleep
+
+filter_by_pattern:
+  params: [bucket_name, file_list, pattern]
+  steps:
+    - init:
+        assign:
+          - result: ""
+          - i: 0
+    - check_condition:
+        switch:
+          - condition: ${len(file_list) > i}
+            next: iterate
+        next: exit_loop
+    - iterate:
+        assign:
+          - result: ${result + ("gs://" + bucket_name + file_list[i].name)}
+          - i: ${i+1}
+        next: check_condition
+    - exit_loop:
+        return:
+          ingestList: ${result}
